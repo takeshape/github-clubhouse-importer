@@ -9,7 +9,7 @@
     "ghch": "src/index.js"
   },
   "engines": {
-    "node": ">=8.11"
+    "node": ">=8.10"
   },
   "keywords": [
     "github",
@@ -28,7 +28,9 @@
     "@octokit/rest": "^16.24.3",
     "chalk": "^2.4.2",
     "clubhouse-lib": "^0.5.0",
+    "lodash.chunk": "^4.2.0",
     "meow": "^5.0.0",
+    "node-fetch": "^2.6.0",
     "ora": "^3.4.0"
   }
 }

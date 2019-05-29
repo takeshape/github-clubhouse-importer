@@ -1,119 +1,122 @@
-const Octokit = require('@octokit/rest')
-const Clubhouse = require('clubhouse-lib')
-const ora = require('ora')
-const chalk = require('chalk')
+const Octokit = require('@octokit/rest');
+const Clubhouse = require('clubhouse-lib');
+const fetch = require('node-fetch');
+const ora = require('ora');
+const chalk = require('chalk');
+const chunk = require('lodash.chunk');
 
-const log = console.log
+const log = console.log;
 
-const githubClubhouseImport = options => {
-  validateOptions(options)
-  const octokit = new Octokit({
-    auth: options.githubToken,
-  })
-
-  const [owner, repo] = options.githubUrl.split('/')
-
-  function fetchGithubIssues() {
-    const octokitOptions = octokit.issues.listForRepo.endpoint.merge({
-      owner,
-      repo,
-      per_page: 100,
-      state: options.state,
-    })
-    return octokit
-      .paginate(octokitOptions)
-      .then(data => {
-        const issues = data.filter(issue => !issue.pull_request)
-        return issues
-      })
-      .catch(err => {
-        spinner.fail(
-          `Failed to fetch issues from ${chalk.underline(options.githubUrl)}\n`
-        )
-        log(chalk.red(err))
-      })
-  }
-
-  function importIssuesToClubhouse(issues) {
-    const clubhouse = Clubhouse.create(options.clubhouseToken)
-    return clubhouse
-      .getProject(options.clubhouseProject)
-      .then(project => {
-        let issuesImported = 0
-        return Promise.all(
-          issues.map(({ created_at, updated_at, labels, title, body }) => {
-            const story_type = getStoryType(labels)
-            return reflect(
-              clubhouse
-                .createStory({
-                  created_at,
-                  updated_at,
-                  story_type,
-                  name: title,
-                  description: body,
-                  project_id: project.id,
-                })
-                .then(() => (issuesImported = issuesImported + 1))
-                .catch(() => {
-                  log(chalk.red(`Failed to import issue #${issue.number}`))
-                })
-            )
-          })
-        ).then(() => {
-          return issuesImported
-        })
-      })
-      .catch(() => {
-        log(
-          chalk.red(
-            `Clubhouse Project ID ${
-              options.clubhouseProject
-            } could not be found`
-          )
-        )
-      })
-  }
-
-  const githubSpinner = ora('Retrieving issues from Github').start()
-  fetchGithubIssues().then(issues => {
-    githubSpinner.succeed(
-      `Retrieved ${chalk.bold(issues.length)} issues from Github`
-    )
-    const clubhouseSpinner = ora('Importing issues into Clubhouse').start()
-    importIssuesToClubhouse(issues).then(issuesImported => {
-      clubhouseSpinner.succeed(
-        `Imported ${chalk.bold(issuesImported)} issues into Clubhouse`
-      )
-    })
-  })
+async function fetchGithubIssues(options) {
+  const octokit = new Octokit({auth: options.githubToken});
+  const [owner, repo] = options.githubUrl.split('/');
+  const octokitOptions = octokit.issues.listForRepo.endpoint.merge({
+    owner,
+    repo,
+    per_page: 100,
+    state: options.state,
+  });
+  const data = await octokit.paginate(octokitOptions);
+  return data.filter(issue => !issue.pull_request);
 }
 
-const validateOptions = options => {
-  let hasError = false
+function getStoryType(labels) {
+  if (labels.find(label => label.name.includes('bug'))) return 'bug';
+  if (labels.find(label => label.name.includes('chore'))) return 'chore';
+  return 'feature';
+}
+
+
+function getStory(project_id, {html_url, created_at, updated_at, labels, title, body}) {
+  const story_type = getStoryType(labels);
+  return {
+    created_at,
+    updated_at,
+    story_type,
+    name: title,
+    description: body || '',
+    external_id: html_url,
+    project_id,
+    labels: labels.map(label => ({
+      color: `#${label.color}`,
+      name: label.name
+    }))
+  };
+}
+
+
+async function createStories(options, stories) {
+  const res = await fetch(`https://api.clubhouse.io/api/v2/stories/bulk?token=${options.clubhouseToken}`, {
+    method: 'POST',
+    body: JSON.stringify({stories}),
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const body = await res.json();
+
+  if (!res.ok) {
+    throw new Error(`${res.statusText}:\n${JSON.stringify(body, null, 2)}`);
+  }
+
+  return body;
+}
+
+async function importIssuesToClubhouse(options, issues) {
+  try {
+    const clubhouse = Clubhouse.create(options.clubhouseToken);
+    const project = await clubhouse.getProject(options.clubhouseProject);
+
+    const stories = issues.map(issue => getStory(project.id, issue));
+    const batches = chunk(stories, 10);
+
+    let issuesImported = 0;
+    await Promise.all(
+      batches.map(async batch => {
+        try {
+          const added = await createStories(options, batch);
+          issuesImported += added.length;
+        } catch (e) {
+          log(chalk.red(`Failed to import batch #${issue.number}: \n ${e.message}`));
+        }
+      })
+    );
+
+    return issuesImported
+
+
+  } catch(error) {
+    log(chalk.red(`Clubhouse Project ID ${options.clubhouseProject} could not be found`));
+  }
+}
+
+function validateOptions(options) {
+  let hasError = false;
   if (!options.githubToken) {
-    hasError = true
+    hasError = true;
     log(chalk.red(`Usage: ${chalk.bold('--github-token')} arg is required`))
   }
 
   if (!options.clubhouseToken) {
-    hasError = true
+    hasError = true;
     log(chalk.red(`Usage: ${chalk.bold('--clubhouse-token')} arg is required`))
   }
 
   if (!options.clubhouseProject) {
-    hasError = true
+    hasError = true;
     log(
       chalk.red(`Usage: ${chalk.bold('--clubhouse-project')} arg is required`)
     )
   }
 
   if (!options.githubUrl) {
-    hasError = true
+    hasError = true;
     log(chalk.red(`Usage: ${chalk.bold('--github-url')} arg is required`))
   }
 
   if (!['open', 'closed', 'all'].includes(options.state.toLowerCase())) {
-    hasError = true
+    hasError = true;
     log(
       chalk.red(
         `Usage: ${chalk.bold('--state')} must be one of open | closed | all`
@@ -122,18 +125,28 @@ const validateOptions = options => {
   }
 
   if (hasError) {
-    log()
-    process.exit(1)
+    log();
+    process.exit(1);
   }
 }
 
-function getStoryType(labels) {
-  if (labels.find(label => label.name.includes('bug'))) return 'bug'
-  if (labels.find(label => label.name.includes('chore'))) return 'chore'
-  return 'feature'
+async function githubClubhouseImport(options) {
+  validateOptions(options);
+  let issues;
+  const githubSpinner = ora('Retrieving issues from Github').start();
+  try {
+    issues =  await fetchGithubIssues(options);
+    githubSpinner.succeed(`Retrieved ${chalk.bold(issues.length)} issues from Github`);
+  } catch(err) {
+    githubSpinner.fail(`Failed to fetch issues from ${chalk.underline(options.githubUrl)}\n`);
+    log(chalk.red(err))
+  }
+
+  if (issues) {
+    const clubhouseSpinner = ora('Importing issues into Clubhouse').start();
+    const issuesImported = await importIssuesToClubhouse(options, issues);
+    clubhouseSpinner.succeed(`Imported ${chalk.bold(issuesImported)} issues into Clubhouse`);
+  }
 }
 
-const reflect = p =>
-  p.then(v => ({ v, status: 'fulfilled' }), e => ({ e, status: 'rejected' }))
-
-module.exports.default = githubClubhouseImport
+module.exports.default = githubClubhouseImport;
